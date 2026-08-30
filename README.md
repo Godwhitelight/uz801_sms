@@ -178,6 +178,23 @@ Mark a message as read.
 
 Returns device info: IMEI, firmware version, network operator, signal strength.
 
+#### `get_sim_info() -> dict`
+
+Returns SIM card info: IMSI, IMEI, ICCID, carrier name, MCC/MNC, signal quality.
+
+#### `get_phone_number() -> str`
+
+Returns the phone number (MSISDN) of the SIM.
+
+**How it works:** The UZ801's modem firmware has a broken SIM file-access layer — `AT+CRSM` returns "file not found" for EF_MSISDN (the SIM file that stores the phone number). The Android `service call` method returns a factory default number, not the actual assigned number. 
+
+To get the real phone number, this method **extracts it from the carrier's welcome SMS** — the activation message carriers send when a SIM is first inserted (e.g. "Congratulations. You can now use your Pelephone number: 0503499844"). This means the SIM must have received at least one SMS mentioning the number.
+
+```python
+number = dongle.get_phone_number()
+print(f"This SIM's number: {number}")
+```
+
 #### `reboot()`
 
 Reboot the dongle.

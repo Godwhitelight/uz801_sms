@@ -25,6 +25,21 @@ from uz801_sms.exceptions import (
 OnSMSCallback = Callable[[SMS], None]
 
 
+def _parse_parcel_string(raw: str) -> str:
+    """Extract the string value from an Android ``service call`` Parcel response.
+
+    The Parcel format shows hex and ASCII side by side. The ASCII column
+    (between single quotes) contains the string characters with dots for
+    null bytes. We strip the dots to get the actual value.
+    """
+    import re as _re
+    ascii_parts = _re.findall(r"'([^']*)'", raw)
+    if not ascii_parts:
+        return ""
+    full = "".join(ascii_parts)
+    return full.replace(".", "").strip()
+
+
 class UZ801:
     """High-level interface to a UZ801 LTE dongle.
 
@@ -132,20 +147,205 @@ class UZ801:
     # ================================================================
 
     def get_info(self) -> dict[str, str]:
-        """Return device info (IMEI, firmware, model, network, etc.)."""
+        """Return device info (IMEI, firmware, model, network, etc.).
+
+        Returns a dict with keys like ``model``, ``firmware``,
+        ``android_version``, ``imei``, ``network``, ``signal``.
+        All values are strings (may be empty if unavailable).
+        """
         info = {}
         info["model"] = self._adb.shell("getprop ro.product.model")
         info["firmware"] = self._adb.shell("getprop ro.build.display.id")
         info["android_version"] = self._adb.shell("getprop ro.build.version.release")
-        info["imei"] = self._adb.shell("service call iphonesubinfo 1 2>/dev/null")
-        # Clean up IMEI (service call returns hex)
-        if info["imei"]:
-            imei_match = re.findall(r"[0-9]", info["imei"])
-            if imei_match:
-                info["imei"] = "".join(imei_match)[:15]
-        info["network"] = self._at_command("AT+COPS?")
-        info["signal"] = self._at_command("AT+CSQ")
+        info["imei"] = self._get_imei()
+        info["network"] = self._clean_at("AT+COPS?")
+        info["signal"] = self._clean_at("AT+CSQ")
         return {k: v for k, v in info.items() if v}
+
+    def get_sim_info(self) -> dict[str, str]:
+        """Return SIM card info.
+
+        Retrieves as many identifiers as possible from the SIM and modem:
+
+        - ``imsi``: International Mobile Subscriber Identity (always available)
+        - ``imei``: International Mobile Equipment Identity
+        - ``iccid``: Integrated Circuit Card ID (SIM serial number)
+        - ``msisdn``: Phone number (often empty on prepaid SIMs)
+        - ``carrier``: Network operator name
+        - ``mcc``: Mobile Country Code (e.g. ``425`` = Israel)
+        - ``mnc``: Mobile Network Code (e.g. ``030`` = Pelephone)
+        - ``signal``: Signal quality (0-31, higher is better)
+
+        Note:
+            Many prepaid SIMs do not have the MSISDN (phone number)
+            field programmed. In that case ``msisdn`` will be empty.
+            You can often find the number in the carrier's welcome SMS
+            (check ``dongle.read_sms()``).
+        """
+        info: dict[str, str] = {}
+
+        # IMSI — always available
+        imsi_raw = self._at_command("AT+CIMI")
+        imsi = re.sub(r"[^0-9]", "", imsi_raw)
+        if len(imsi) >= 10:
+            info["imsi"] = imsi
+            info["mcc"] = imsi[:3]
+            info["mnc"] = imsi[3:6]
+
+        # IMEI
+        info["imei"] = self._get_imei()
+
+        # ICCID (SIM serial number)
+        iccid_raw = self._at_command("AT+QCCID")
+        if "ERROR" not in iccid_raw and "+QCCID" not in iccid_raw:
+            iccid = re.sub(r"[^0-9]", "", iccid_raw)
+            if len(iccid) >= 18:
+                info["iccid"] = iccid
+        # Fallback: try AT+ICCID
+        if "iccid" not in info:
+            iccid_raw2 = self._at_command("AT+ICCID")
+            iccid2 = re.sub(r"[^0-9]", "", iccid_raw2)
+            if len(iccid2) >= 18:
+                info["iccid"] = iccid2
+
+        # MSISDN (phone number) — often empty on prepaid SIMs
+        cnum_raw = self._at_command("AT+CNUM")
+        # Response: +CNUM: "Name","+972501234567",129
+        msisdn_match = re.search(r'\+CNUM:\s*"[^"]*","([^"]+)"', cnum_raw)
+        if msisdn_match:
+            info["msisdn"] = msisdn_match.group(1)
+        else:
+            info["msisdn"] = ""  # SIM doesn't have it programmed
+
+        # Carrier name
+        cops_raw = self._at_command("AT+COPS?")
+        carrier_match = re.search(r'\+COPS:\s*[^,]*,[^,]*,"([^"]+)"', cops_raw)
+        if carrier_match:
+            info["carrier"] = carrier_match.group(1)
+        else:
+            # Fallback: from Android properties
+            info["carrier"] = self._adb.shell("getprop gsm.operator.alpha")
+
+        # Signal
+        csq_raw = self._at_command("AT+CSQ")
+        csq_match = re.search(r"\+CSQ:\s*(\d+)", csq_raw)
+        if csq_match:
+            info["signal"] = csq_match.group(1)
+
+        return {k: v for k, v in info.items() if v}
+
+    def get_phone_number(self) -> str:
+        """Return the phone number (MSISDN) of the SIM, or empty string.
+
+        Tries three methods in order and returns the first success:
+
+            1. ``AT+CNUM`` — read MSISDN directly from the SIM's EF_MSISDN
+               file via AT command. Rarely works on the UZ801 because the
+               modem firmware has a broken SIM file-access layer.
+            2. Android ``service call iphonesubinfo`` — scans transaction
+               codes 1-20 for a phone-number-like value. On the UZ801 this
+               typically returns a **factory default** number (e.g.
+               ``+972505000151``) that is NOT the actual assigned number.
+               Used as a fallback only.
+            3. **Welcome SMS extraction** — searches the SMS inbox for a
+               carrier activation/welcome message containing a phone number
+               (e.g. Pelephone's "Congratulations. You can now use your
+               Pelephone number: 0503499844"). This is the most reliable
+               method on the UZ801 and is preferred over the service call
+               result when both are available.
+
+        Returns:
+            The phone number as a string (e.g. ``"0503499844"`` or
+            ``"+972503499844"``), or ``""`` if not found.
+
+        Note:
+            The UZ801's modem firmware cannot read EF_MSISDN from the SIM
+            (``AT+CRSM`` returns "file not found" for file 0x6F40). The
+            ``service call`` method returns a factory default, not the real
+            assigned number. **The phone number is extracted from the
+            carrier's welcome SMS**, not from the SIM's own storage. This
+            means the SIM must have received at least one SMS from the
+            carrier that mentions the phone number.
+        """
+        # Method 1: AT+CNUM (SIM-stored MSISDN)
+        cnum_raw = self._at_command("AT+CNUM")
+        match = re.search(r'\+CNUM:\s*"[^"]*","([^"]+)"', cnum_raw)
+        if match:
+            return match.group(1)
+
+        # Method 2: Android service call (may return factory default)
+        service_result = ""
+        for code in range(1, 21):
+            raw = self._adb.shell(f"service call iphonesubinfo {code} 2>/dev/null")
+            if not raw or "Error" in raw or "ffffff" in raw:
+                continue
+            parsed = _parse_parcel_string(raw)
+            cleaned = parsed.strip()
+            if cleaned and (
+                (cleaned.startswith("+") and len(cleaned) >= 8 and cleaned[1:].isdigit())
+                or (cleaned.isdigit() and len(cleaned) >= 8 and len(cleaned) <= 15)
+            ):
+                service_result = cleaned
+                break
+
+        # Method 3: Parse carrier welcome SMS (most reliable on UZ801)
+        sms_result = self._extract_number_from_sms()
+
+        # Prefer SMS result (actual assigned number) over service call (factory default)
+        if sms_result:
+            return sms_result
+        return service_result
+
+    def _extract_number_from_sms(self) -> str:
+        """Search SMS inbox for a carrier welcome message with a phone number.
+
+        Looks for SMS containing keywords like "number", "your number",
+        "phone number" and extracts the digits.
+
+        Returns the phone number as a string, or empty string if not found.
+        """
+        messages = self.read_sms("inbox")
+        if not messages:
+            return ""
+
+        # Patterns to match phone numbers in SMS text
+        # Israeli numbers: 0XX-XXX-XXXX or 0XXXXXXXXX or +972XXXXXXXXX
+        number_patterns = [
+            # "your number: 0503499844" / "number: 0503499844"
+            re.compile(r'number[:\s]+(0\d{8,9})', re.IGNORECASE),
+            re.compile(r'number[:\s]+(\+972\d{8,9})', re.IGNORECASE),
+            # "Your Pelephone number: 0503499844"
+            re.compile(r'(\d{10})', re.IGNORECASE),  # 10-digit Israeli mobile
+            # Generic: any 9-10 digit sequence starting with 0 or +972
+            re.compile(r'(\+972\d{8,9})'),
+            re.compile(r'(0[5-9]\d{7,8})'),  # Israeli mobile: 05X/06X/07X/08X/09X
+        ]
+
+        # Keywords that indicate a welcome/activation SMS
+        keywords = ["number", "your", "welcome", "congratulations",
+                    "activation", "activated"]
+
+        for sms in messages:
+            body = sms.body or ""
+            body_lower = body.lower()
+
+            # Check if this SMS looks like a carrier welcome message
+            if not any(kw in body_lower for kw in keywords):
+                continue
+
+            # Try each number pattern
+            for pattern in number_patterns:
+                match = pattern.search(body)
+                if match:
+                    number = match.group(1)
+                    # Validate: Israeli mobile numbers are 10 digits starting with 0
+                    # or international format +972 + 9 digits
+                    if number.startswith("0") and len(number) == 10:
+                        return number
+                    elif number.startswith("+972") and len(number) >= 12:
+                        return number
+
+        return ""
 
     # ================================================================
     #  READ SMS
@@ -438,6 +638,21 @@ class UZ801:
             f"kill %2 2>/dev/null; wait"
         )
         return self._adb.shell(shell_cmd, timeout=10)
+
+    def _clean_at(self, cmd: str) -> str:
+        """Send an AT command and clean up the response (remove echo/OK)."""
+        raw = self._at_command(cmd)
+        lines = [l.strip() for l in raw.splitlines()
+                 if l.strip() and not l.strip().startswith("AT")
+                 and l.strip() != "OK" and "echo" not in l.lower()]
+        return "\n".join(lines) if lines else raw
+
+    def _get_imei(self) -> str:
+        """Get the device IMEI from Android service call."""
+        raw = self._adb.shell("service call iphonesubinfo 1 2>/dev/null")
+        parsed = _parse_parcel_string(raw)
+        digits = re.sub(r"[^0-9]", "", parsed)
+        return digits[:15] if len(digits) >= 14 else ""
 
     def shell(self, cmd: str) -> str:
         """Run an arbitrary shell command on the dongle. Power users only."""
