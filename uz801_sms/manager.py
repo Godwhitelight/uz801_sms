@@ -622,6 +622,230 @@ class UZ801:
         self._monitoring = False
 
     # ================================================================
+    #  SMS POLLER (on-device interceptor)
+    # ================================================================
+
+    def start_poller(self) -> bool:
+        """Start the on-device SmsPoller process.
+
+        The SmsPoller is a small Java program that runs directly on the
+        dongle (via ``app_process``) and polls ``content://sms`` every
+        500ms. It writes incoming SMS to ``/data/local/tmp/sms_hook/``
+        before the Mms app can delete them (~2s window).
+
+        This is necessary because the UZ801's Mms app auto-deletes
+        incoming SMS shortly after receipt. The poller captures the
+        full message (including multi-part and unicode) before deletion.
+
+        Prerequisites:
+            - The smshook.dex file must be deployed to the dongle.
+              Call :meth:`deploy_poller` first if not already deployed.
+
+        Returns:
+            ``True`` if the poller is running, ``False`` if deployment failed.
+        """
+        # Check if already running
+        ps = self._adb.shell("ps | grep app_process 2>/dev/null")
+        if "com.godwhitelight.smshook.SmsPoller" in ps:
+            return True
+
+        # Check if dex is deployed
+        check = self._adb.shell("ls /data/local/tmp/smshook.dex 2>/dev/null")
+        if "No such file" in check or not check.strip():
+            if not self.deploy_poller():
+                return False
+
+        # Start the poller in background
+        self._adb.shell(
+            "export ANDROID_DATA=/data && "
+            "export CLASSPATH=/data/local/tmp/smshook.dex && "
+            "app_process /data/local/tmp com.godwhitelight.smshook.SmsPoller "
+            "> /data/local/tmp/smshook.log 2>&1 &",
+            timeout=5
+        )
+
+        # Wait for it to start
+        time.sleep(3)
+        log = self._adb.shell("cat /data/local/tmp/smshook.log 2>/dev/null")
+        if "SmsPoller: Starting" in log or "Polling every" in log:
+            print("[uz801_sms] SmsPoller running on dongle")
+            return True
+        print(f"[uz801_sms] SmsPoller failed to start. Log: {log}")
+        return False
+
+    def stop_poller(self) -> bool:
+        """Kill the SmsPoller process on the dongle.
+
+        Returns:
+            ``True`` if the process was found and killed.
+        """
+        # Find and kill the poller process
+        ps = self._adb.shell("ps | grep SmsPoller 2>/dev/null")
+        if not ps.strip():
+            return False
+        self._adb.shell("pkill -f SmsPoller 2>/dev/null || killall app_process 2>/dev/null")
+        time.sleep(1)
+        return True
+
+    def deploy_poller(self) -> bool:
+        """Deploy the smshook.dex file to the dongle.
+
+        The pre-compiled DEX is bundled with this library. It's pushed to
+        ``/data/local/tmp/smshook.dex`` on the dongle.
+
+        Returns:
+            ``True`` if deployment succeeded.
+        """
+        import os
+
+        # Find the DEX file bundled with the library
+        lib_dir = os.path.dirname(os.path.abspath(__file__))
+        dex_path = os.path.join(lib_dir, "smshook.dex")
+
+        if not os.path.exists(dex_path):
+            # Try parent directory (repo root)
+            dex_path = os.path.join(os.path.dirname(lib_dir), "smshook.dex")
+
+        if not os.path.exists(dex_path):
+            print("[uz801_sms] smshook.dex not found. See smshook/README.md for build instructions.")
+            return False
+
+        # Push to dongle
+        adb = self._adb.adb_path
+        import subprocess
+        result = subprocess.run(
+            [adb, "push", dex_path, "/data/local/tmp/smshook.dex"],
+            capture_output=True, timeout=10
+        )
+        if result.returncode != 0:
+            print(f"[uz801_sms] Failed to push smshook.dex")
+            return False
+
+        # Create output directory
+        self._adb.shell("mkdir -p /data/local/tmp/sms_hook")
+        self._adb.shell("chmod 777 /data/local/tmp/sms_hook")
+
+        print("[uz801_sms] smshook.dex deployed")
+        return True
+
+    def read_captured(self) -> list[SMS]:
+        """Read SMS captured by the on-device SmsPoller.
+
+        Returns SMS messages written to ``/data/local/tmp/sms_hook/``
+        by the poller. These are messages that may have been deleted
+        from the content provider before :meth:`read_sms` could see them.
+
+        Returns:
+            List of :class:`SMS` objects from captured files.
+        """
+        # Read the _latest.txt file
+        raw = self._adb.shell("cat /data/local/tmp/sms_hook/_latest.txt 2>/dev/null")
+        if not raw.strip():
+            return []
+
+        messages = []
+        # Entries are separated by "---"
+        for block in raw.split("---"):
+            block = block.strip()
+            if not block:
+                continue
+            sms = self._parse_captured_block(block)
+            if sms:
+                messages.append(sms)
+
+        return messages
+
+    def _parse_captured_block(self, block: str) -> Optional[SMS]:
+        """Parse a key=value block from the SmsPoller's _latest.txt."""
+        fields = {}
+        for line in block.split("\n"):
+            line = line.strip()
+            if "=" in line:
+                k, v = line.split("=", 1)
+                fields[k.strip()] = v.strip()
+
+        if "id" not in fields:
+            return None
+
+        try:
+            sms_id = int(fields.get("id", 0))
+        except ValueError:
+            return None
+
+        try:
+            ts = int(fields.get("timestamp", 0))
+        except ValueError:
+            ts = 0
+
+        return SMS(
+            id=sms_id,
+            sender=fields.get("sender", ""),
+            body=fields.get("body", ""),
+            timestamp=ts,
+            status=SMSStatus.INBOX,
+            read=ReadState.UNREAD,
+            service_center=fields.get("service_center", ""),
+            raw=fields,
+        )
+
+    def monitor_with_poller(
+        self,
+        callback: OnSMSCallback,
+        interval: float = 1.0,
+        auto_delete: bool = True,
+    ) -> None:
+        """Monitor for new SMS using the on-device poller.
+
+        This is the recommended way to receive SMS on the UZ801. It uses
+        the on-device SmsPoller to capture messages before the Mms app
+        deletes them, then polls the captured files.
+
+        Args:
+            callback: Called with each new :class:`SMS`.
+            interval: Polling interval in seconds (default 1).
+            auto_delete: Clear captured files after reading (default True).
+
+        Example::
+
+            dongle.start_poller()
+
+            def on_sms(sms):
+                print(f"From {sms.sender}: {sms.body}")
+
+            dongle.monitor_with_poller(on_sms)
+        """
+        # Ensure poller is running
+        if not self.start_poller():
+            print("[uz801_sms] Could not start poller. Falling back to content provider.")
+            return self.monitor(callback, interval=interval, auto_delete=auto_delete)
+
+        seen_ids: set[int] = set()
+        print(f"[uz801_sms] Monitoring with on-device poller (interval={interval}s)")
+
+        try:
+            while self._monitoring:
+                captured = self.read_captured()
+                for sms in captured:
+                    if sms.id not in seen_ids:
+                        seen_ids.add(sms.id)
+                        try:
+                            callback(sms)
+                        except Exception as e:
+                            print(f"[uz801_sms] Callback error: {e}")
+
+                if auto_delete:
+                    self._adb.shell(
+                        "echo '' > /data/local/tmp/sms_hook/_latest.txt 2>/dev/null"
+                    )
+                    seen_ids.clear()
+
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            print("\n[uz801_sms] Monitoring stopped.")
+        finally:
+            self._monitoring = False
+
+    # ================================================================
     #  LOW-LEVEL
     # ================================================================
 
